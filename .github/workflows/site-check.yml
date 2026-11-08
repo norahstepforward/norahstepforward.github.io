@@ -1,0 +1,100 @@
+name: site-check
+
+on:
+  schedule:
+    - cron: '17 1 * * *'   # UTC 01:17 = 北京 09:17：每日体检
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: site-check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 站点体检（失败项隔 10s 复测一次再定性，R3 纪律）
+        id: check
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 - <<'PY' | tee check-result.txt
+          import sys, time, urllib.request, urllib.error
+
+          SITE = "https://norahstepforward.github.io"
+          SHELL = '<div id="root">'
+          CHECKS = [
+              ("home",      f"{SITE}/",                  "200+title"),
+              ("frontier",  f"{SITE}/frontier",          "spa"),
+              ("industry",  f"{SITE}/industry",          "spa"),
+              ("tools",     f"{SITE}/tools",             "spa"),
+              ("knowledge", f"{SITE}/knowledge",         "spa"),
+              ("about",     f"{SITE}/about",             "spa"),
+              ("gzh-qr",    f"{SITE}/images/gzh-qr.png", "200"),
+          ]
+
+          def probe(url):
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 site-check"})
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      return r.status, r.read().decode("utf-8", "ignore")
+              except urllib.error.HTTPError as e:
+                  try: body = e.read().decode("utf-8", "ignore")
+                  except Exception: body = ""
+                  return e.code, body
+              except Exception as e:
+                  return 0, f"网络异常: {e}"
+
+          def judge(status, body, expect):
+              if expect == "200":
+                  return status == 200
+              if expect == "200+title":
+                  return status == 200 and "诺拉" in body
+              if expect == "spa":
+                  if status == 200: return SHELL in body
+                  if status == 404: return SHELL in body and "/assets/" in body
+                  return False
+              return False
+
+          results = []
+          for cid, url, expect in CHECKS:
+              status, body = probe(url)
+              ok = judge(status, body, expect)
+              if not ok:
+                  time.sleep(10)
+                  status, body = probe(url)
+                  ok = judge(status, body, expect)
+                  if ok:
+                      results.append((cid, True, "复测恢复", f"HTTP {status}"))
+                      continue
+              results.append((cid, ok, "", f"HTTP {status}"))
+
+          print(f"站点体检  {time.strftime('%Y-%m-%d %H:%M:%S')}  {SITE}")
+          print("-" * 56)
+          for cid, ok, note, detail in results:
+              print(f" {'✓' if ok else '✗'} {cid:<10} {detail} {('（' + note + '）') if note else ''}")
+          print("-" * 56)
+          failed = [r for r in results if not r[1]]
+          print(f" 结果: {'PASS' if not failed else 'FAIL'} （{len(results)-len(failed)}/{len(results)}）")
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: 失败开 Issue 告警
+        if: steps.check.outcome == 'failure'
+        shell: bash
+        run: |
+          ISSUE_BODY=$(cat check-result.txt)
+          jq -n --arg t "站点巡检异常 $(date -u +'%Y-%m-%d %H:%M UTC')" --arg b "$ISSUE_BODY" '{title: $t, body: $b, labels: ["site-check"]}' > payload.json
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues \
+            --data-binary @payload.json
+
+      - name: 汇总
+        if: always()
+        run: echo "outcome=${{ steps.check.outcome }}"
